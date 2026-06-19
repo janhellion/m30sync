@@ -219,7 +219,10 @@ def merge_gapless(files, output_path):
         "-filter_complex", filter_str,
         "-map", "[a]",
         "-c:a", "flac",
-        "-compression_level", "8",
+        "-compression_level", "5",
+        "-ar", "44100",
+        "-sample_fmt", "s16",
+        "-ac", "2",
         str(output_path),
     ]
 
