@@ -198,11 +198,40 @@ def read_tags_quiet(path):
 # ── gapless merge ───────────────────────────────────────────────────
 
 def merge_gapless(files, output_path):
-    """Merge multiple audio files into a single gapless FLAC using ffmpeg.
+    """Merge multiple audio files into a single gapless FLAC.
+
+    Strategy (in order):
+      1. concat protocol + `-c copy` — lossless bitstream merge, no re-encode.
+         Works when all files share the same sample rate / bit depth / channels.
+      2. If that fails, concat demuxer + `-c:a flac` — re-encode fallback.
 
     Returns True on success.
     """
-    # Build ffmpeg concat file list with absolute paths
+    abs_paths = [str(f.resolve()) for f in files]
+
+    # ── Strategy 1: concat protocol + copy (lossless, no re-encode) ──
+    concat_spec = "concat:" + "|".join(abs_paths)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", concat_spec,
+        "-c", "copy",
+        "-f", "flac",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode == 0:
+        input_total = sum(f.stat().st_size for f in files)
+        output_size = output_path.stat().st_size if output_path.exists() else 0
+        ratio = output_size / input_total if input_total else 0
+        print(f"  Lossless merge — {', '.join(f.name for f in files[:3])}{' ...' if len(files) > 3 else ''}")
+        print(f"  Input total: {input_total / 1024**2:.0f} MB → Output: {output_size / 1024**2:.0f} MB ({ratio:.0%})")
+        # Warn if output seems suspiciously small
+        if ratio < 0.5:
+            print(f"  ⚠ Output is only {ratio:.0%} of input size — may indicate encoding mismatch")
+        return True
+
+    # ── Strategy 2: concat demuxer + re-encode (fallback) ──
+    print(f"  Lossless copy failed (files may differ in sample rate/bit depth), re-encoding...")
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         concat_path = f.name
         for src in files:
@@ -223,6 +252,10 @@ def merge_gapless(files, output_path):
         if result.returncode != 0:
             print(f"  ffmpeg error: {result.stderr.strip()[-300:]}")
             return False
+
+        input_total = sum(f.stat().st_size for f in files)
+        output_size = output_path.stat().st_size if output_path.exists() else 0
+        print(f"  Re-encoded — {output_size / 1024**2:.0f} MB from {input_total / 1024**2:.0f} MB input")
         return True
     finally:
         os.unlink(concat_path)
