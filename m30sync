@@ -50,12 +50,18 @@ def safe_name(s):
     return s.strip("._ ")
 
 
-def build_target_name(artist, title, ext):
-    """Build a clean filename: Artist - Title.ext"""
+def build_target_name(artist, title, ext, track=""):
+    """Build a clean filename with optional track prefix: 01 Artist - Title.ext"""
+    prefix = ""
+    if track:
+        try:
+            prefix = f"{int(track):02d} "
+        except (ValueError, TypeError):
+            pass
     base = " - ".join(p for p in [artist, title] if p)
     if not base:
         return None
-    return f"{safe_name(base)}{ext}"
+    return f"{prefix}{safe_name(base)}{ext}"
 
 
 def confirm(prompt, default=True):
@@ -405,7 +411,7 @@ def copy_playlist(playlist_path, m30, args):
             continue
 
         artist, title, album, track, genre, year = tags
-        target_name = build_target_name(artist, title, src.suffix.lower())
+        target_name = build_target_name(artist, title, src.suffix.lower(), track)
         if not target_name:
             print("no name — skipped")
             skipped += 1
@@ -539,7 +545,7 @@ def sync(args):
                 continue
 
             artist, title, album, track, genre, year = tags
-            target_name = build_target_name(artist, title, ext)
+            target_name = build_target_name(artist, title, ext, track)
             if not target_name:
                 print("no name — skipped")
                 skipped_cnt += 1
