@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""
+m30sync — Transfer music to Mechen M30 with tag stripping + DB reset.
+
+Usage:
+  m30sync /path/to/source/file.flac                  # single file
+  m30sync /path/to/source/directory/                 # all files in dir
+  m30sync /path/to/src1.flac /path/to/src2.mp3 ...   # multiple items
+  m30sync /mnt/HAVAMAL/Music/00_CheckedDownloads/*/  # all artist dirs
+  m30sync --clean                                     # only remove M30 DB files
+
+Behaviour:
+  1. Finds all FLAC/MP3 under source paths
+  2. Strips tags down to TITLE, ARTIST, ALBUM, TRACKNUMBER, GENRE (single), DATE
+  3. Copies to M30 with standardised filenames
+  4. Prompts to delete MUSIC.LIB + ALBUM.PIC so M30 rebuilds its DB
+"""
+
+import argparse
+import os
+import shutil
+import stat
+import sys
+import time
+from pathlib import Path
+
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, TCON, TYER
+
+# ── config ──────────────────────────────────────────────────────────
+M30_MOUNT = "/run/media/janhellion/MECHEN M30"
+DB_FILES = ["MUSIC.LIB", "ALBUM.PIC", "M3U.LIB"]
+AUDIO_EXTS = {".flac", ".mp3"}
+
+# ── tag stripping ───────────────────────────────────────────────────
+
+def strip_tags_flac(path):
+    """Return (artist, title, album, track, genre, year) or None."""
+    audio = FLAC(path)
+    def g(*keys):
+        for k in keys:
+            v = audio.get(k)
+            if v and v[0]:
+                return v[0].strip()
+        return ""
+
+    title  = g("title", "TITLE")
+    artist = g("artist", "ARTIST")
+    album  = g("album", "ALBUM")
+    raw_tr = g("tracknumber", "TRACKNUMBER")
+    raw_ge = g("genre", "GENRE")
+    raw_dt = g("date", "DATE", "originalyear", "ORIGINALYEAR")
+
+    if not title and not artist:
+        return None
+
+    track = raw_tr.split("/")[0].strip() if raw_tr else ""
+    genre = raw_ge.split(";")[0].strip()[:30] if raw_ge else ""
+    year  = raw_dt.split("-")[0].strip()[:4] if raw_dt else ""
+
+    # Rewrite with clean tags
+    audio.clear()
+    audio["TITLE"] = title
+    audio["ARTIST"] = artist
+    if album:  audio["ALBUM"] = album
+    if track:  audio["TRACKNUMBER"] = track
+    if genre:  audio["GENRE"] = genre
+    if year:   audio["DATE"] = year
+    audio.save()
+    return artist, title, album, track, genre, year
+
+
+def strip_tags_mp3(path):
+    """Return (artist, title, album, track, genre, year) or None."""
+    try:
+        id3 = ID3(path)
+    except Exception:
+        id3 = ID3()
+
+    title = artist = album = track = genre = year = None
+    for fid, frame in id3.items():
+        f = fid.upper(); t = str(frame)
+        if f == "TIT2":   title = t
+        elif f == "TPE1": artist = t
+        elif f == "TALB": album = t
+        elif f == "TRCK": track = t.split("/")[0]
+        elif f == "TCON": genre = t.split(";")[0][:30]
+        elif f in ("TYER","TDRC"): year = t.split("-")[0][:4]
+
+    if not title and not artist:
+        return None
+
+    id3.delete()
+    id3 = ID3()
+    if title:  id3.add(TIT2(encoding=3, text=title))
+    if artist: id3.add(TPE1(encoding=3, text=artist))
+    if album:  id3.add(TALB(encoding=3, text=album))
+    if track:  id3.add(TRCK(encoding=3, text=track))
+    if genre:  id3.add(TCON(encoding=3, text=genre))
+    if year:   id3.add(TYER(encoding=3, text=year))
+    id3.save(path, v1=2)
+    return artist, title, album, track, genre, year
+
+
+def strip_tags(path):
+    ext = Path(path).suffix.lower()
+    if ext == ".flac":  return strip_tags_flac(path)
+    if ext == ".mp3":   return strip_tags_mp3(path)
+    return None
+
+# ── filename standardisation ────────────────────────────────────────
+
+def safe_name(s):
+    """Make a string filesystem-safe (exFAT-safe)."""
+    forbidden = '<>:"/\\|?*'
+    for ch in forbidden:
+        s = s.replace(ch, "_")
+    # Collapse multiple spaces/underscores
+    while "  " in s:  s = s.replace("  ", " ")
+    while "__" in s:  s = s.replace("__", "_")
+    return s.strip("._ ")
+
+
+def build_target_name(artist, title, album, track, ext):
+    """Build a clean filename: Artist - Title.ext"""
+    parts = []
+    if artist:
+        parts.append(artist)
+    if title:
+        parts.append(title)
+    if not parts:
+        return None
+    base = " - ".join(parts)
+    base = safe_name(base)
+    return f"{base}{ext}"
+
+
+# ── transfer engine ────────────────────────────────────────────────
+
+def collect_sources(paths):
+    """Yield (src_path, rel_dest_dir) for every audio file found."""
+    for src in paths:
+        p = Path(src).expanduser().resolve()
+        if not p.exists():
+            print(f"  SKIP (not found): {p}")
+            continue
+
+        if p.is_file() and p.suffix.lower() in AUDIO_EXTS:
+            yield (p, "")
+            continue
+
+        if p.is_dir():
+            for f in sorted(p.rglob("*")):
+                if f.suffix.lower() in AUDIO_EXTS:
+                    # Preserve relative directory structure for albums
+                    rel = str(f.parent.relative_to(p)) if str(f.parent.relative_to(p)) != "." else ""
+                    yield (f, rel)
+
+
+def sync(args):
+    m30 = Path(M30_MOUNT)
+    if not m30.is_dir():
+        print(f"ERROR: M30 not mounted at {M30_MOUNT}")
+        print("Plug it in or mount it first.")
+        sys.exit(1)
+
+    # Check free space
+    st = os.statvfs(str(m30))
+    free_gb = st.f_frsize * st.f_bavail / (1024**3)
+    print(f"M30 mounted — {free_gb:.1f} GB free")
+
+    sources = list(collect_sources(args.source))
+    if not sources:
+        print("No audio files found in sources.")
+        return
+    print(f"Found {len(sources)} audio files to process\n")
+
+    # ── dry-run / summary ──
+    if args.dry_run:
+        print("DRY RUN — no files will be modified\n")
+        for src, _ in sources[:20]:
+            tags = strip_tags(src)
+            if tags:
+                a, t, al, tr, g, y = tags
+                print(f"  {src.name}")
+                print(f"    → {a} — {t}")
+            else:
+                print(f"  {src.name}  (no tags — skipped)")
+        if len(sources) > 20:
+            print(f"  ... and {len(sources)-20} more")
+        print()
+        return
+
+    copied = skipped_cnt = error_cnt = 0
+    total_bytes = 0
+
+    for idx, (src, rel_dir) in enumerate(sources, 1):
+        ext = src.suffix.lower()
+        print(f"[{idx}/{len(sources)}] {src.name}  ", end="", flush=True)
+
+        try:
+            tags = strip_tags(str(src))
+        except Exception as e:
+            print(f"ERROR (tag strip): {e}")
+            error_cnt += 1
+            continue
+
+        if not tags:
+            print("no tags — skipped")
+            skipped_cnt += 1
+            continue
+
+        artist, title, album, track, genre, year = tags
+
+        # Build target path on M30
+        target_name = build_target_name(artist, title, album, track, ext)
+        if not target_name:
+            print("no artist/title — skipped")
+            skipped_cnt += 1
+            continue
+
+        # Album subdirectory on M30
+        if album and args.album_dirs:
+            album_dir = safe_name(f"{artist} - {album}" if artist else album)
+            target_dir = m30 / album_dir
+        elif artist:
+            target_dir = m30 / safe_name(artist)
+        else:
+            target_dir = m30
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        dst = target_dir / target_name
+
+        # Skip if already exists with same size
+        if dst.exists() and dst.stat().st_size == src.stat().st_size:
+            print("exists")
+            skipped_cnt += 1
+            continue
+
+        try:
+            shutil.copy2(str(src), str(dst))
+            copied += 1
+            total_bytes += src.stat().st_size
+            size_mb = src.stat().st_size / (1024**2)
+            print(f"OK  ({size_mb:.1f} MB)")
+        except Exception as e:
+            # Try chmod +w on destination in case of permissions
+            try:
+                os.chmod(str(dst), stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+                shutil.copy2(str(src), str(dst))
+                copied += 1
+                total_bytes += src.stat().st_size
+                size_mb = src.stat().st_size / (1024**2)
+                print(f"OK with chmod ({size_mb:.1f} MB)")
+            except Exception as e2:
+                print(f"ERROR: {e2}")
+                error_cnt += 1
+
+    # ── summary ──
+    print(f"\n{'='*50}")
+    print(f"Copied: {copied}  |  Skipped: {skipped_cnt}  |  Errors: {error_cnt}")
+    if total_bytes:
+        print(f"Transferred: {total_bytes/(1024**3):.2f} GB")
+
+    # ── database cleanup prompt ──
+    db_paths = [m30 / db for db in DB_FILES]
+    existing_db = [p for p in db_paths if p.exists()]
+    if existing_db:
+        print(f"\nM30 database files found: {', '.join(p.name for p in existing_db)}")
+        if not args.yes:
+            try:
+                resp = input("Delete them so M30 rebuilds DB? [Y/n] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                resp = "y"
+            if resp in ("", "y", "yes"):
+                args.yes = True
+        if args.yes:
+            for p in existing_db:
+                p.unlink()
+                print(f"  Deleted: {p.name}")
+            print("Unplug and replug the M30 to rebuild the library.")
+        else:
+            print("Database files left in place (new files won't appear).")
+
+    if args.clean:
+        # Only-clean mode: remove DB files and exit
+        pass  # handled above
+
+
+def cmd_clean(args):
+    """--clean: just remove M30 database files."""
+    m30 = Path(M30_MOUNT)
+    if not m30.is_dir():
+        print(f"M30 not mounted at {M30_MOUNT}")
+        return
+    removed = 0
+    for db in DB_FILES:
+        p = m30 / db
+        if p.exists():
+            p.unlink()
+            print(f"  Deleted: {db}")
+            removed += 1
+    if removed:
+        print("Unplug and replug M30 to rebuild library.")
+    else:
+        print("No database files found on M30.")
+
+
+# ── entry point ─────────────────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Transfer music to Mechen M30 with minimal tags",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    ap.add_argument("source", nargs="*", help="Source files or directories")
+    ap.add_argument("-n", "--dry-run", action="store_true",
+                    help="Show what would be done without copying")
+    ap.add_argument("-y", "--yes", action="store_true",
+                    help="Auto-answer yes to DB deletion prompt")
+    ap.add_argument("--album-dirs", action="store_true",
+                    help="Create 'Artist - Album' subdirectories instead of flat Artist dirs")
+    ap.add_argument("--clean", action="store_true",
+                    help="Only delete M30 database files, skip transfer")
+    args = ap.parse_args()
+
+    if args.clean:
+        cmd_clean(args)
+    elif not args.source:
+        ap.print_help()
+    else:
+        sync(args)
+
+
+if __name__ == "__main__":
+    main()
