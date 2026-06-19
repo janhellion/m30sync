@@ -4,23 +4,27 @@ m30sync — Transfer music to Mechen M30 with tag stripping + DB reset.
 
 Usage:
   m30sync /path/to/source/file.flac                  # single file
-  m30sync /path/to/source/directory/                 # all files in dir
-  m30sync /path/to/src1.flac /path/to/src2.mp3 ...   # multiple items
-  m30sync /mnt/HAVAMAL/Music/00_CheckedDownloads/*/  # all artist dirs
+  m30sync /path/to/source/directory/                 # all files in dir (asks about gapless merge)
+  m30sync /path/to/playlist.m3u                      # upload playlist as folder
   m30sync --clean                                     # only remove M30 DB files
+  m30sync --gapless /path/to/album/                   # force merge without prompt
 
 Behaviour:
   1. Finds all FLAC/MP3 under source paths
   2. Strips tags down to TITLE, ARTIST, ALBUM, TRACKNUMBER, GENRE (single), DATE
   3. Copies to M30 with standardised filenames
-  4. Prompts to delete MUSIC.LIB + ALBUM.PIC so M30 rebuilds its DB
+  4. For directories: prompts to merge album into a single gapless FLAC
+  5. For M3U playlists: resolves paths and uploads as a named folder
+  6. Prompts to delete MUSIC.LIB + ALBUM.PIC so M30 rebuilds its DB
 """
 
 import argparse
 import os
 import shutil
 import stat
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -32,11 +36,50 @@ M30_MOUNT = "/run/media/janhellion/MECHEN M30"
 DB_FILES = ["MUSIC.LIB", "ALBUM.PIC", "M3U.LIB"]
 AUDIO_EXTS = {".flac", ".mp3"}
 
+# ── helpers ─────────────────────────────────────────────────────────
+
+def safe_name(s):
+    """Make a string filesystem-safe (exFAT-safe)."""
+    forbidden = '<>:"/\\|?*'
+    for ch in forbidden:
+        s = s.replace(ch, "_")
+    while "  " in s:
+        s = s.replace("  ", " ")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s.strip("._ ")
+
+
+def build_target_name(artist, title, ext):
+    """Build a clean filename: Artist - Title.ext"""
+    base = " - ".join(p for p in [artist, title] if p)
+    if not base:
+        return None
+    return f"{safe_name(base)}{ext}"
+
+
+def confirm(prompt, default=True):
+    """Ask yes/no via stdin. Returns bool."""
+    if default:
+        prompt += " [Y/n] "
+    else:
+        prompt += " [y/N] "
+    try:
+        resp = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        resp = ""
+    if default:
+        return resp in ("", "y", "yes")
+    else:
+        return resp in ("y", "yes")
+
+
 # ── tag stripping ───────────────────────────────────────────────────
 
 def strip_tags_flac(path):
     """Return (artist, title, album, track, genre, year) or None."""
     audio = FLAC(path)
+
     def g(*keys):
         for k in keys:
             v = audio.get(k)
@@ -44,9 +87,9 @@ def strip_tags_flac(path):
                 return v[0].strip()
         return ""
 
-    title  = g("title", "TITLE")
+    title = g("title", "TITLE")
     artist = g("artist", "ARTIST")
-    album  = g("album", "ALBUM")
+    album = g("album", "ALBUM")
     raw_tr = g("tracknumber", "TRACKNUMBER")
     raw_ge = g("genre", "GENRE")
     raw_dt = g("date", "DATE", "originalyear", "ORIGINALYEAR")
@@ -56,16 +99,15 @@ def strip_tags_flac(path):
 
     track = raw_tr.split("/")[0].strip() if raw_tr else ""
     genre = raw_ge.split(";")[0].strip()[:30] if raw_ge else ""
-    year  = raw_dt.split("-")[0].strip()[:4] if raw_dt else ""
+    year = raw_dt.split("-")[0].strip()[:4] if raw_dt else ""
 
-    # Rewrite with clean tags
     audio.clear()
     audio["TITLE"] = title
     audio["ARTIST"] = artist
-    if album:  audio["ALBUM"] = album
-    if track:  audio["TRACKNUMBER"] = track
-    if genre:  audio["GENRE"] = genre
-    if year:   audio["DATE"] = year
+    if album:   audio["ALBUM"] = album
+    if track:   audio["TRACKNUMBER"] = track
+    if genre:   audio["GENRE"] = genre
+    if year:    audio["DATE"] = year
     audio.save()
     return artist, title, album, track, genre, year
 
@@ -79,13 +121,20 @@ def strip_tags_mp3(path):
 
     title = artist = album = track = genre = year = None
     for fid, frame in id3.items():
-        f = fid.upper(); t = str(frame)
-        if f == "TIT2":   title = t
-        elif f == "TPE1": artist = t
-        elif f == "TALB": album = t
-        elif f == "TRCK": track = t.split("/")[0]
-        elif f == "TCON": genre = t.split(";")[0][:30]
-        elif f in ("TYER","TDRC"): year = t.split("-")[0][:4]
+        f = fid.upper()
+        t = str(frame)
+        if f == "TIT2":
+            title = t
+        elif f == "TPE1":
+            artist = t
+        elif f == "TALB":
+            album = t
+        elif f == "TRCK":
+            track = t.split("/")[0]
+        elif f == "TCON":
+            genre = t.split(";")[0][:30]
+        elif f in ("TYER", "TDRC"):
+            year = t.split("-")[0][:4]
 
     if not title and not artist:
         return None
@@ -104,35 +153,275 @@ def strip_tags_mp3(path):
 
 def strip_tags(path):
     ext = Path(path).suffix.lower()
-    if ext == ".flac":  return strip_tags_flac(path)
-    if ext == ".mp3":   return strip_tags_mp3(path)
+    if ext == ".flac":
+        return strip_tags_flac(path)
+    if ext == ".mp3":
+        return strip_tags_mp3(path)
     return None
 
-# ── filename standardisation ────────────────────────────────────────
 
-def safe_name(s):
-    """Make a string filesystem-safe (exFAT-safe)."""
-    forbidden = '<>:"/\\|?*'
-    for ch in forbidden:
-        s = s.replace(ch, "_")
-    # Collapse multiple spaces/underscores
-    while "  " in s:  s = s.replace("  ", " ")
-    while "__" in s:  s = s.replace("__", "_")
-    return s.strip("._ ")
-
-
-def build_target_name(artist, title, album, track, ext):
-    """Build a clean filename: Artist - Title.ext"""
-    parts = []
-    if artist:
-        parts.append(artist)
-    if title:
-        parts.append(title)
-    if not parts:
+def read_tags_quiet(path):
+    """Read tags without modifying the file."""
+    ext = Path(path).suffix.lower()
+    try:
+        if ext == ".flac":
+            audio = FLAC(path)
+            def g(*keys):
+                for k in keys:
+                    v = audio.get(k)
+                    if v and v[0]:
+                        return str(v[0]).strip()
+                return ""
+            return (g("title", "TITLE"), g("artist", "ARTIST"),
+                    g("album", "ALBUM"), g("tracknumber", "TRACKNUMBER"),
+                    g("genre", "GENRE"), g("date", "DATE", "originalyear", "ORIGINALYEAR"))
+        elif ext == ".mp3":
+            id3 = ID3(path)
+            t = str(id3.get("TIT2", "")).strip()
+            a = str(id3.get("TPE1", "")).strip()
+            al = str(id3.get("TALB", "")).strip()
+            tr = str(id3.get("TRCK", "")).split("/")[0].strip()
+            g = str(id3.get("TCON", "")).split(";")[0].strip()[:30]
+            y = str(id3.get("TYER", "") or id3.get("TDRC", "")).split("-")[0].strip()[:4]
+            return (t, a, al, tr, g, y)
+    except Exception:
         return None
-    base = " - ".join(parts)
-    base = safe_name(base)
-    return f"{base}{ext}"
+    return None
+
+
+# ── gapless merge ───────────────────────────────────────────────────
+
+def merge_gapless(files, output_path):
+    """Merge multiple audio files into a single gapless FLAC using ffmpeg.
+
+    Returns True on success.
+    """
+    # Build ffmpeg concat file list with absolute paths
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        concat_path = f.name
+        for src in files:
+            f.write(f"file '{src.resolve()}'\n")
+
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_path,
+            "-c:a", "flac",
+            "-vn",
+            "-compression_level", "8",
+            str(output_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            print(f"  ffmpeg error: {result.stderr.strip()[-300:]}")
+            return False
+        return True
+    finally:
+        os.unlink(concat_path)
+
+
+def get_common_tags(files):
+    """Get the most common artist/album/genre/year across a set of files."""
+    from collections import Counter
+    artists = Counter()
+    albums = Counter()
+    genres = Counter()
+    years = Counter()
+    total = 0
+    for f in files:
+        tags = read_tags_quiet(f)
+        if not tags:
+            continue
+        _, artist, album, _, genre, year = tags
+        if artist:  artists[artist] += 1
+        if album:   albums[album] += 1
+        if genre:   genres[genre] += 1
+        if year:    years[year] += 1
+        total += 1
+    return (
+        total,
+        artists.most_common(1)[0][0] if artists else "",
+        albums.most_common(1)[0][0] if albums else "",
+        genres.most_common(1)[0][0] if genres else "",
+        years.most_common(1)[0][0] if years else "",
+    )
+
+
+def copy_gapless_album(sources, m30, args):
+    """Merge + upload a gapless album. sources is list of (Path, rel_dir)."""
+    files = [s[0] for s in sources]
+    # Determine album name from directory or tags
+    parent = files[0].parent
+    dir_name = parent.name
+
+    _, artist, album, genre, year = get_common_tags(files)
+    if not album:
+        album = dir_name
+
+    # Merge filename
+    merge_name = safe_name(f"{artist} - {album}.flac" if artist else album)
+    dst = m30 / merge_name
+
+    if dst.exists() and dst.stat().st_size > 0 and not args.force:
+        print(f"  Merged file exists: {merge_name}")
+        if not confirm("  Re-merge and overwrite?"):
+            print("  Skipped.")
+            return 1
+
+    print(f"  Merging {len(files)} tracks into one gapless file...")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Strip tags on all source files first
+        stripped = []
+        for f in files:
+            tags = strip_tags(str(f))
+            stripped.append((f, tags))
+
+        # Merge
+        merged_tmp = Path(tmpdir) / merge_name
+        if not merge_gapless(files, merged_tmp):
+            print("  Merge failed.")
+            return 0
+
+        # Tag the merged file
+        total_tracks, artist, album, genre, year = get_common_tags(files)
+        if artist:
+            FLAC(str(merged_tmp))
+            merged_flac = FLAC(str(merged_tmp))
+            merged_flac.clear()
+            merged_flac["TITLE"] = album or dir_name
+            merged_flac["ARTIST"] = artist
+            merged_flac["ALBUM"] = album or dir_name
+            merged_flac["TRACKNUMBER"] = "1"
+            merged_flac["GENRE"] = genre or ""
+            merged_flac["DATE"] = year or ""
+            # Build CUE sheet for chapter navigation
+            cue = build_cue_sheet(files, artist, album, year)
+            if cue:
+                merged_flac["CUESHEET"] = cue
+            merged_flac.save()
+
+        # Copy to M30
+        size_mb = merged_tmp.stat().st_size / (1024**2)
+        shutil.copy2(str(merged_tmp), str(dst))
+        print(f"  OK  ({size_mb:.1f} MB) — {merge_name}")
+        return len(files)
+
+
+def build_cue_sheet(files, artist, album, year):
+    """Build a CUE sheet from individual track tags for chapter navigation."""
+    lines = []
+    if artist:
+        lines.append(f'PERFORMER "{artist}"')
+    if album:
+        lines.append(f'TITLE "{album}"')
+    if year:
+        lines.append(f'REM DATE "{year}"')
+    lines.append('FILE "" WAVE')
+
+    # Calculate cumulative sample offsets
+    offset = 0
+    for i, f in enumerate(files, 1):
+        tags = read_tags_quiet(f)
+        if tags:
+            title = tags[0] or f.stem
+        else:
+            title = f.stem
+        # Get duration via ffprobe
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-show_entries",
+                 "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
+                 str(f)],
+                capture_output=True, text=True, timeout=30
+            )
+            duration = float(result.stdout.strip() or 0)
+        except Exception:
+            duration = 0
+
+        mins = int(offset) // 60
+        secs = int(offset) % 60
+        frames = 0
+        lines.append(f"  TRACK {i:02d} AUDIO")
+        lines.append(f'    TITLE "{title}"')
+        lines.append(f'    PERFORMER "{artist}"')
+        lines.append(f"    INDEX 01 {mins:02d}:{secs:02d}:{frames:02d}")
+        offset += duration
+
+    return "\n".join(lines)
+
+
+# ── playlist support ────────────────────────────────────────────────
+
+def parse_m3u(playlist_path):
+    """Parse an M3U/M3U8 playlist file. Returns list of resolved file paths."""
+    playlist_path = Path(playlist_path).resolve()
+    base_dir = playlist_path.parent
+    files = []
+
+    with open(playlist_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Resolve relative to playlist location
+            candidate = Path(line)
+            if not candidate.is_absolute():
+                candidate = base_dir / candidate
+            candidate = candidate.resolve()
+            if candidate.exists() and candidate.suffix.lower() in AUDIO_EXTS:
+                files.append(candidate)
+
+    return files
+
+
+def copy_playlist(playlist_path, m30, args):
+    """Upload playlist tracks as a named folder on the M30."""
+    playlist_path = Path(playlist_path)
+    folder_name = safe_name(playlist_path.stem)
+    target_dir = m30 / folder_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    files = parse_m3u(playlist_path)
+    if not files:
+        print(f"  No playable tracks found in {playlist_path.name}")
+        return 0, 0, 0
+
+    print(f"  Playlist \"{folder_name}\": {len(files)} tracks")
+
+    copied = skipped = errors = 0
+    for src in files:
+        print(f"    {src.name}  ", end="", flush=True)
+        try:
+            tags = strip_tags(str(src))
+        except Exception as e:
+            print(f"ERROR: {e}")
+            errors += 1
+            continue
+        if not tags:
+            print("no tags — skipped")
+            skipped += 1
+            continue
+
+        artist, title, album, track, genre, year = tags
+        target_name = build_target_name(artist, title, src.suffix.lower())
+        if not target_name:
+            print("no name — skipped")
+            skipped += 1
+            continue
+
+        dst = target_dir / target_name
+        if dst.exists() and dst.stat().st_size == src.stat().st_size:
+            print("exists")
+            skipped += 1
+            continue
+
+        shutil.copy2(str(src), str(dst))
+        copied += 1
+        print("OK")
+
+    return copied, skipped, errors
 
 
 # ── transfer engine ────────────────────────────────────────────────
@@ -152,8 +441,9 @@ def collect_sources(paths):
         if p.is_dir():
             for f in sorted(p.rglob("*")):
                 if f.suffix.lower() in AUDIO_EXTS:
-                    # Preserve relative directory structure for albums
-                    rel = str(f.parent.relative_to(p)) if str(f.parent.relative_to(p)) != "." else ""
+                    rel = ""
+                    if str(f.parent.relative_to(p)) != ".":
+                        rel = str(f.parent.relative_to(p))
                     yield (f, rel)
 
 
@@ -161,130 +451,157 @@ def sync(args):
     m30 = Path(M30_MOUNT)
     if not m30.is_dir():
         print(f"ERROR: M30 not mounted at {M30_MOUNT}")
-        print("Plug it in or mount it first.")
         sys.exit(1)
 
-    # Check free space
     st = os.statvfs(str(m30))
     free_gb = st.f_frsize * st.f_bavail / (1024**3)
-    print(f"M30 mounted — {free_gb:.1f} GB free")
+    print(f"M30 mounted — {free_gb:.1f} GB free\n")
 
-    sources = list(collect_sources(args.source))
+    # Separate playlist files from regular sources
+    playlist_sources = []
+    regular_sources = []
+    for s in args.source:
+        p = Path(s).expanduser().resolve()
+        if p.is_file() and p.suffix.lower() in (".m3u", ".m3u8"):
+            playlist_sources.append(p)
+        else:
+            regular_sources.append(s)
+
+    # ── handle playlists ──
+    total_copied = total_skipped = total_errors = 0
+    for ps in playlist_sources:
+        print(f"[PLAYLIST] {ps.name}")
+        c, s, e = copy_playlist(ps, m30, args)
+        total_copied += c
+        total_skipped += s
+        total_errors += e
+        print()
+
+    if not regular_sources:
+        # Only playlists were given
+        print(f"Playlists done: {total_copied} copied, {total_skipped} skipped, {total_errors} errors")
+        if total_copied:
+            prompt_db_cleanup(m30, args)
+        return
+
+    # ── collect regular sources ──
+    sources = list(collect_sources(regular_sources))
     if not sources:
         print("No audio files found in sources.")
         return
     print(f"Found {len(sources)} audio files to process\n")
 
-    # ── dry-run / summary ──
     if args.dry_run:
-        print("DRY RUN — no files will be modified\n")
+        print("DRY RUN\n")
         for src, _ in sources[:20]:
             tags = strip_tags(src)
             if tags:
                 a, t, al, tr, g, y = tags
-                print(f"  {src.name}")
-                print(f"    → {a} — {t}")
+                print(f"  {src.name}  →  {a} — {t}")
             else:
-                print(f"  {src.name}  (no tags — skipped)")
+                print(f"  {src.name}  (no tags)")
         if len(sources) > 20:
-            print(f"  ... and {len(sources)-20} more")
-        print()
+            print(f"  ... and {len(sources) - 20} more")
         return
 
-    copied = skipped_cnt = error_cnt = 0
-    total_bytes = 0
+    # ── gapless merge for single-directory albums ──
+    # Detect if all sources come from one directory
+    parent_dirs = {src.parent for src, _ in sources}
+    is_single_album = (
+        args.gapless
+        or (len(parent_dirs) == 1 and len(sources) > 1
+            and not args.no_gapless
+            and (args.yes or not sys.stdin.isatty()
+                 or confirm(f"Album \"{parent_dirs.pop().name}\" — merge into single gapless file?")))
+    )
 
-    for idx, (src, rel_dir) in enumerate(sources, 1):
-        ext = src.suffix.lower()
-        print(f"[{idx}/{len(sources)}] {src.name}  ", end="", flush=True)
+    if is_single_album and len(sources) > 1:
+        copied = copy_gapless_album(sources, m30, args)
+    else:
+        # ── normal copy ──
+        copied = skipped_cnt = error_cnt = 0
+        total_bytes = 0
 
-        try:
-            tags = strip_tags(str(src))
-        except Exception as e:
-            print(f"ERROR (tag strip): {e}")
-            error_cnt += 1
-            continue
+        for idx, (src, rel_dir) in enumerate(sources, 1):
+            ext = src.suffix.lower()
+            print(f"[{idx}/{len(sources)}] {src.name}  ", end="", flush=True)
 
-        if not tags:
-            print("no tags — skipped")
-            skipped_cnt += 1
-            continue
-
-        artist, title, album, track, genre, year = tags
-
-        # Build target path on M30
-        target_name = build_target_name(artist, title, album, track, ext)
-        if not target_name:
-            print("no artist/title — skipped")
-            skipped_cnt += 1
-            continue
-
-        # Album subdirectory on M30
-        if album and args.album_dirs:
-            album_dir = safe_name(f"{artist} - {album}" if artist else album)
-            target_dir = m30 / album_dir
-        elif artist:
-            target_dir = m30 / safe_name(artist)
-        else:
-            target_dir = m30
-
-        target_dir.mkdir(parents=True, exist_ok=True)
-        dst = target_dir / target_name
-
-        # Skip if already exists with same size
-        if dst.exists() and dst.stat().st_size == src.stat().st_size:
-            print("exists")
-            skipped_cnt += 1
-            continue
-
-        try:
-            shutil.copy2(str(src), str(dst))
-            copied += 1
-            total_bytes += src.stat().st_size
-            size_mb = src.stat().st_size / (1024**2)
-            print(f"OK  ({size_mb:.1f} MB)")
-        except Exception as e:
-            # Try chmod +w on destination in case of permissions
             try:
-                os.chmod(str(dst), stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+                tags = strip_tags(str(src))
+            except Exception as e:
+                print(f"ERROR: {e}")
+                error_cnt += 1
+                continue
+
+            if not tags:
+                print("no tags — skipped")
+                skipped_cnt += 1
+                continue
+
+            artist, title, album, track, genre, year = tags
+            target_name = build_target_name(artist, title, ext)
+            if not target_name:
+                print("no name — skipped")
+                skipped_cnt += 1
+                continue
+
+            if album and args.album_dirs:
+                album_dir = safe_name(f"{artist} - {album}" if artist else album)
+                target_dir = m30 / album_dir
+            elif artist:
+                target_dir = m30 / safe_name(artist)
+            else:
+                target_dir = m30
+
+            target_dir.mkdir(parents=True, exist_ok=True)
+            dst = target_dir / target_name
+
+            if dst.exists() and dst.stat().st_size == src.stat().st_size:
+                print("exists")
+                skipped_cnt += 1
+                continue
+
+            try:
                 shutil.copy2(str(src), str(dst))
                 copied += 1
                 total_bytes += src.stat().st_size
-                size_mb = src.stat().st_size / (1024**2)
-                print(f"OK with chmod ({size_mb:.1f} MB)")
-            except Exception as e2:
-                print(f"ERROR: {e2}")
-                error_cnt += 1
+                print(f"OK  ({src.stat().st_size / 1024**2:.1f} MB)")
+            except Exception:
+                try:
+                    os.chmod(str(dst), stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+                    shutil.copy2(str(src), str(dst))
+                    copied += 1
+                    total_bytes += src.stat().st_size
+                    print(f"OK (chmod) ({src.stat().st_size / 1024**2:.1f} MB)")
+                except Exception as e2:
+                    print(f"ERROR: {e2}")
+                    error_cnt += 1
 
-    # ── summary ──
-    print(f"\n{'='*50}")
-    print(f"Copied: {copied}  |  Skipped: {skipped_cnt}  |  Errors: {error_cnt}")
-    if total_bytes:
-        print(f"Transferred: {total_bytes/(1024**3):.2f} GB")
+        print(f"\n{'=' * 50}")
+        print(f"Copied: {copied}  |  Skipped: {skipped_cnt}  |  Errors: {error_cnt}")
+        if total_bytes:
+            print(f"Transferred: {total_bytes / 1024**3:.2f} GB")
 
-    # ── database cleanup prompt ──
+    # ── DB cleanup ──
+    prompt_db_cleanup(m30, args)
+
+    if args.clean:
+        pass
+
+
+def prompt_db_cleanup(m30, args):
+    """Prompt to delete M30 database files."""
     db_paths = [m30 / db for db in DB_FILES]
     existing_db = [p for p in db_paths if p.exists()]
     if existing_db:
-        print(f"\nM30 database files found: {', '.join(p.name for p in existing_db)}")
-        if not args.yes:
-            try:
-                resp = input("Delete them so M30 rebuilds DB? [Y/n] ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                resp = "y"
-            if resp in ("", "y", "yes"):
-                args.yes = True
-        if args.yes:
+        print(f"\nM30 database files: {', '.join(p.name for p in existing_db)}")
+        if args.yes or confirm("Delete so M30 rebuilds DB?"):
             for p in existing_db:
                 p.unlink()
                 print(f"  Deleted: {p.name}")
             print("Unplug and replug the M30 to rebuild the library.")
-        else:
-            print("Database files left in place (new files won't appear).")
-
-    if args.clean:
-        # Only-clean mode: remove DB files and exit
-        pass  # handled above
+    elif any((m30 / db).exists() for db in DB_FILES):
+        pass  # already clean
 
 
 def cmd_clean(args):
@@ -314,13 +631,19 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument("source", nargs="*", help="Source files or directories")
+    ap.add_argument("source", nargs="*", help="Source files, directories, or .m3u playlists")
     ap.add_argument("-n", "--dry-run", action="store_true",
                     help="Show what would be done without copying")
     ap.add_argument("-y", "--yes", action="store_true",
-                    help="Auto-answer yes to DB deletion prompt")
+                    help="Auto-answer yes to all prompts")
     ap.add_argument("--album-dirs", action="store_true",
-                    help="Create 'Artist - Album' subdirectories instead of flat Artist dirs")
+                    help="Create 'Artist - Album' subdirectories")
+    ap.add_argument("--gapless", action="store_true",
+                    help="Merge album into single gapless file (skip prompt)")
+    ap.add_argument("--no-gapless", action="store_true",
+                    help="Skip gapless prompt, copy individual files")
+    ap.add_argument("--force", action="store_true",
+                    help="Overwrite existing files on M30")
     ap.add_argument("--clean", action="store_true",
                     help="Only delete M30 database files, skip transfer")
     args = ap.parse_args()
